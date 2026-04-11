@@ -131,6 +131,37 @@ else
 fi
 
 #
+# Claude OAuth persistence path tests (issue #48)
+#
+
+echo ""
+echo "--- Claude OAuth Persistence Paths (issue #48) ---"
+
+CLAUDE_HOME="$HOME/.sandbox_claude_home_$$"
+mkdir -p "$CLAUDE_HOME/existing-dir"
+echo "original" >"$CLAUDE_HOME/existing-dir/existing.txt"
+
+echo "Test: Claude lock and temp paths under HOME are writable"
+if HOME="$CLAUDE_HOME" ./sandbox sh -c 'mkdir "$HOME/.claude.lock" && rmdir "$HOME/.claude.lock" && : >"$HOME/.claude.json.lock" && rm -f "$HOME/.claude.json.lock" && : >"$HOME/.claude.json.tmp.$$" && rm -f "$HOME/.claude.json.tmp.$$"' 2>/dev/null; then
+	pass "Claude lock and temp paths under HOME are writable"
+else
+	fail "Claude lock and temp paths under HOME are writable"
+fi
+
+echo "Test: Existing HOME entries stay read-only"
+if HOME="$CLAUDE_HOME" ./sandbox sh -c 'echo changed >"$HOME/existing-dir/existing.txt"' 2>/dev/null; then
+	fail "Existing HOME entries stay read-only"
+else
+	if [[ "$(cat "$CLAUDE_HOME/existing-dir/existing.txt")" == "original" ]]; then
+		pass "Existing HOME entries stay read-only"
+	else
+		fail "Existing HOME entries stay read-only: content changed"
+	fi
+fi
+
+rm -rf "$CLAUDE_HOME"
+
+#
 # Read-only path tests
 #
 

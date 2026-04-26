@@ -119,6 +119,34 @@ else
 fi
 
 echo ""
+echo "Test: non-Claude modes skip Claude authentication preflight"
+if (
+	source "$FUNCTIONS_ONLY"
+	command_flag=""
+	CCO_COMMAND=""
+	shell_mode=false
+	needs_claude_authentication
+
+	shell_mode=true
+	! needs_claude_authentication
+	shell_mode=false
+
+	command_flag="codex"
+	! needs_claude_authentication
+	command_flag="opencode"
+	! needs_claude_authentication
+	command_flag=""
+
+	CCO_COMMAND="custom-tool"
+	! needs_claude_authentication
+	unset CCO_COMMAND
+); then
+	pass "non-Claude modes skip Claude authentication preflight"
+else
+	fail "non-Claude modes skip Claude authentication preflight"
+fi
+
+echo ""
 echo "Test: OAuth preflight refreshes automatically inside preemptive window"
 if (
 	PATH="$FAKE_BIN:$PATH"

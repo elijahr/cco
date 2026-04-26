@@ -820,7 +820,7 @@ run_unsandboxed_claude_refresh() {
 	read -ra claude_cmd <<<"$claude_cmd_str"
 	refresh_dir=$(mktemp -d)
 
-	log "Running a one-shot unsandboxed Claude call to refresh OAuth credentials..."
+	log "Refreshing Claude OAuth credentials before starting sandbox; this may take a moment..."
 	(
 		cd "$refresh_dir" || exit 1
 		"${claude_cmd[@]}" -p --output-format text --no-session-persistence "Reply with OK and nothing else."

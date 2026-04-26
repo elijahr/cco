@@ -237,7 +237,7 @@ cco --deny-path ~/Downloads
 - `--docker-socket` (experimental): Binds the host Docker socket into the sandbox so Claude can control Docker on your machine. This defeats the isolation barrier—avoid unless you explicitly need host Docker access.
 - `--image IMAGE` / `--docker-image IMAGE` (Docker only): Runs `cco` against a specific Docker image instead of the default managed `cco:latest` image. This is useful if you `docker commit` a known-good persistent container yourself and want later `cco` runs to start from that image. With `--pull`, `cco` pulls the chosen image first.
 - `--force-docker-bridge-network` (Docker only): Force bridge networking instead of host networking. By default cco uses `--network=host` when available (Linux, OrbStack). Use this if you need port isolation or want explicit `-p` port forwarding.
-- `--yes` / `-y`: Auto-accept startup recovery prompts such as OAuth refresh or macOS Keychain unlock before `cco` starts.
+- `--yes` / `-y`: Auto-accept startup recovery prompts such as macOS Keychain unlock before `cco` starts. OAuth tokens that expire soon are refreshed automatically before sandbox startup when the selected backend cannot safely persist an in-sandbox refresh.
 - `--allow-oauth-refresh` (experimental): Gives the container write access to your Claude credentials so refreshed tokens sync back to the host. Malicious prompts could corrupt or replace those credentials.
 - `--persist` (Docker only, opt-in): Reuses the default persistent container for the current repo instead of starting fresh each run. `cco` starts it for the invocation and stops it again when the run ends.
 - `--persist=NAME` or `--persist NAME`: Selects a specific persistent session for the current repo so you can keep multiple reusable container filesystems side by side.
@@ -532,10 +532,10 @@ cco restore-creds backup-file.json  # Restore from specific backup
 - On macOS over SSH, `cco` will offer to unlock your login keychain if it cannot read Claude credentials. Use `--yes` to auto-accept that recovery step.
 
 **Token expiration**
-- If you get authentication errors, your OAuth token may have expired
-- The containerized environment prevents automatic token refresh by default
-- **Solution**: Run `claude` directly (outside `cco`) to re-authenticate, then retry with `cco`
-- For automatic token refresh, the beta `--allow-oauth-refresh` flag will sync container credentials back to your host. Only use it if you accept the additional credential tampering risk.
+- If you get authentication errors, your OAuth token may have expired or need a fresh browser login
+- `cco` checks stored OAuth expiry before sandbox startup. When the selected backend cannot safely persist an in-sandbox refresh and the token expires soon, `cco` runs one fixed plain-Claude refresh on the host before entering the sandbox.
+- **Fallback**: Run `claude` directly (outside `cco`) to re-authenticate, then retry with `cco`
+- For in-sandbox refresh sync-back, the beta `--allow-oauth-refresh` flag will sync container credentials back to your host. Only use it if you accept the additional credential tampering risk.
 
 **Docker problems**
 - Start Docker daemon
@@ -547,15 +547,15 @@ cco restore-creds backup-file.json  # Restore from specific backup
 
 **Experimental features not working**
 - OAuth refresh (`--allow-oauth-refresh`) is beta, reduces credential isolation, and may have issues
-- Fallback: authenticate directly with `claude` when tokens expire
+- Fallback: authenticate directly with `claude` if the startup refresh cannot recover credentials
 - Use credential backup/restore commands for safety: `cco backup-creds` / `cco restore-creds`
 
 ### Known Issues
 
-**Token expires during active session (macOS)**
-If Claude stops responding with API errors during an active `cco` session, your OAuth token has likely expired mid-session. This is primarily a macOS issue due to credential storage differences.
+**Token expires during active session**
+If Claude stops responding with API errors during an active `cco` session, your OAuth token has likely expired mid-session. `cco` normally refreshes tokens that expire soon before sandbox startup, but a long-running session can still cross the expiry boundary.
 
-**Root cause**: When Claude Code runs inside the Linux container, it cannot directly update the macOS Keychain on the host system where credentials are stored. The OAuth refresh call is "coming from inside the house" but can't reach the host Keychain.
+**Root cause**: Some sandbox backends cannot safely persist Claude's refreshed OAuth credentials back to the host credential store without granting broader credential or home-directory write access. `cco` keeps the sandbox narrow and performs a fixed host-side refresh before startup when it can predict the expiry.
 
 **Workaround**:
 1. Open a new terminal window
@@ -565,9 +565,7 @@ If Claude stops responding with API errors during an active `cco` session, your 
 5. Quit your current `cco` session
 6. Restart with `cco --resume` to pick up the refreshed credentials
 
-**Linux note**: This issue may not affect Linux systems where credentials are file-based and can potentially be updated with `--allow-oauth-refresh` flag, though this needs more testing.
-
-*PRs welcome to investigate cross-platform solutions for seamless credential refresh.*
+For repeated startup failures, run plain `claude` once to confirm the account can refresh or re-login outside the sandbox, then start `cco` again.
 
 **Stdio-based MCP servers not available**
 If Claude reports that stdio-based MCP servers are not found or not working, they need to be installed inside the container. See [MCP Server Support](#mcp-server-support) section for installation instructions.

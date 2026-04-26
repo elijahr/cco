@@ -772,13 +772,28 @@ oauth_token_needs_startup_refresh() {
 	((expires_at_ms <= now_ms + refresh_window_ms))
 }
 
-oauth_token_needs_preemptive_startup_refresh() {
+oauth_token_is_expired() {
+	local expires_at_ms="$1"
+	local now_ms
+	now_ms=$(($(date +%s) * 1000))
+
+	((expires_at_ms <= now_ms))
+}
+
+oauth_token_needs_background_refresh() {
 	local expires_at_ms="$1"
 	local now_ms refresh_window_ms
 	now_ms=$(($(date +%s) * 1000))
-	refresh_window_ms=$((12 * 60 * 60 * 1000))
+	refresh_window_ms=$((2 * 60 * 60 * 1000))
 
 	((expires_at_ms <= now_ms + refresh_window_ms))
+}
+
+oauth_background_refresh_lock_dir() {
+	local marker_key marker_hash
+	marker_key="$(get_claude_config_dir):$SANDBOX_BACKEND"
+	marker_hash=$(sha256_prefix8 "$marker_key") || return 1
+	printf '%s/cco/oauth-refresh-%s.lock\n' "${XDG_CACHE_HOME:-$HOME/.cache}" "$marker_hash"
 }
 
 backend_can_persist_oauth_refresh() {
@@ -829,6 +844,23 @@ run_unsandboxed_claude_refresh() {
 
 	rm -rf "$refresh_dir"
 	return "$status"
+}
+
+start_background_claude_refresh() {
+	local lock_dir
+	lock_dir=$(oauth_background_refresh_lock_dir) || return 0
+	mkdir -p "$(dirname "$lock_dir")" 2>/dev/null || return 0
+
+	if ! mkdir "$lock_dir" 2>/dev/null; then
+		log "Claude OAuth credential refresh is already running in the background"
+		return 0
+	fi
+
+	log "Refreshing Claude OAuth credentials in the background before they expire..."
+	(
+		trap 'rmdir "$lock_dir" 2>/dev/null || true' EXIT
+		run_unsandboxed_claude_refresh >/dev/null 2>&1 || true
+	) &
 }
 
 confirm_default_yes() {
@@ -990,32 +1022,33 @@ ensure_refreshable_oauth_credentials() {
 		return 0
 	fi
 
-	if ! oauth_token_needs_preemptive_startup_refresh "$expires_at_ms"; then
+	if oauth_token_is_expired "$expires_at_ms"; then
+		if ! run_unsandboxed_claude_refresh; then
+			error "Claude OAuth refresh did not complete"
+			error "Run plain \`$(get_claude_command)\` to re-authenticate, then retry cco."
+			exit 1
+		fi
+
+		credentials_payload=$(get_claude_credentials_payload)
+		if [[ -z "$credentials_payload" ]] || ! expires_at_ms=$(extract_oauth_expiry_ms "$credentials_payload"); then
+			error "Could not verify Claude OAuth credentials after the refresh attempt"
+			error "Run plain \`$(get_claude_command)\` to re-authenticate, then retry cco."
+			exit 1
+		fi
+
+		if oauth_token_is_expired "$expires_at_ms"; then
+			error "Claude OAuth credentials are still expired after the refresh attempt"
+			error "Run plain \`$(get_claude_command)\` to re-authenticate, then retry cco."
+			exit 1
+		fi
+
+		log "Claude OAuth credentials refreshed"
 		return 0
 	fi
 
-	log "Claude OAuth token expires soon; refreshing once before sandbox startup"
-
-	if ! run_unsandboxed_claude_refresh; then
-		if ! oauth_token_needs_startup_refresh "$expires_at_ms"; then
-			warn "Claude OAuth pre-start refresh did not complete; continuing because credentials are still valid"
-			return 0
-		fi
-		error "Claude refresh did not complete successfully"
-		error "Run plain \`$(get_claude_command)\` once outside the sandbox, then retry cco."
-		exit 1
+	if oauth_token_needs_background_refresh "$expires_at_ms"; then
+		start_background_claude_refresh
 	fi
-
-	credentials_payload=$(get_claude_credentials_payload)
-	if [[ -n "$credentials_payload" ]] && expires_at_ms=$(extract_oauth_expiry_ms "$credentials_payload"); then
-		if oauth_token_needs_startup_refresh "$expires_at_ms"; then
-			error "Claude credentials still look expired after the refresh attempt"
-			error "Run plain \`$(get_claude_command)\` outside the sandbox, finish any login flow, then retry cco."
-			exit 1
-		fi
-	fi
-
-	log "Claude OAuth credentials refreshed"
 }
 
 # Verify Claude Code authentication is available

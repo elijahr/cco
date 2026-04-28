@@ -12,6 +12,7 @@ CCO_BIN="$PWD/cco"
 
 PASSED=0
 FAILED=0
+SKIPPED=0
 
 pass() {
 	echo "PASS: $1"
@@ -21,6 +22,11 @@ pass() {
 fail() {
 	echo "FAIL: $1"
 	FAILED=$((FAILED + 1))
+}
+
+skip() {
+	echo "SKIP: $1"
+	SKIPPED=$((SKIPPED + 1))
 }
 
 assert_contains() {
@@ -35,6 +41,10 @@ assert_contains() {
 		printf '%s\n' "$haystack" | sed 's/^/    /'
 		fail "$name"
 	fi
+}
+
+supports_docker() {
+	command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1
 }
 
 echo "=== Startup Preflight Regression Tests ==="
@@ -63,6 +73,7 @@ chmod +x "$FAKE_BIN/security"
 echo "Test: --help documents --yes"
 if output=$("$CCO_BIN" --help 2>&1); then
 	assert_contains "$output" "--yes, -y             Auto-accept startup recovery prompts" "--help shows --yes flag"
+	assert_contains "$output" "CLAUDE_CODE_OAUTH_TOKEN" "--help documents external Claude token"
 else
 	echo "  output:"
 	printf '%s\n' "$output" | sed 's/^/    /'
@@ -108,28 +119,196 @@ else
 fi
 
 echo ""
-echo "Test: OAuth preflight auto-refreshes when --yes is active"
+echo "Test: non-Claude modes skip Claude authentication preflight"
+if (
+	source "$FUNCTIONS_ONLY"
+	command_flag=""
+	CCO_COMMAND=""
+	shell_mode=false
+	needs_claude_authentication
+
+	shell_mode=true
+	! needs_claude_authentication
+	shell_mode=false
+
+	command_flag="codex"
+	! needs_claude_authentication
+	command_flag="opencode"
+	! needs_claude_authentication
+	command_flag=""
+
+	CCO_COMMAND="custom-tool"
+	! needs_claude_authentication
+	unset CCO_COMMAND
+); then
+	pass "non-Claude modes skip Claude authentication preflight"
+else
+	fail "non-Claude modes skip Claude authentication preflight"
+fi
+
+echo ""
+echo "Test: OAuth preflight repairs expired credentials before startup"
 if (
 	PATH="$FAKE_BIN:$PATH"
 	source "$FUNCTIONS_ONLY"
-	yes_flag=true
+	yes_flag=false
 	allow_keychain=false
 	SANDBOX_BACKEND="native"
-	payload_file="$TEST_ROOT/oauth_payload.json"
-	printf '{"expiresAt":1}\n' >"$payload_file"
+	payload_file="$TEST_ROOT/oauth_expired_payload.json"
+	expired_at=$((($(date +%s) - 60) * 1000))
+	fresh_at=4102444800000
+	refresh_attempts=0
+	printf '{"expiresAt":%s}\n' "$expired_at" >"$payload_file"
 	get_claude_credentials_payload() {
 		cat "$payload_file"
 	}
 	run_unsandboxed_claude_refresh() {
-		printf '{"expiresAt":4102444800000}\n' >"$payload_file"
+		refresh_attempts=$((refresh_attempts + 1))
+		printf '{"expiresAt":%s}\n' "$fresh_at" >"$payload_file"
 		return 0
 	}
 	ensure_refreshable_oauth_credentials
+	[[ "$refresh_attempts" -eq 1 ]]
 	[[ "$(cat "$payload_file")" == '{"expiresAt":4102444800000}' ]]
 ); then
-	pass "OAuth preflight auto-refreshes with --yes"
+	pass "OAuth preflight repairs expired credentials before startup"
 else
-	fail "OAuth preflight auto-refreshes with --yes"
+	fail "OAuth preflight repairs expired credentials before startup"
+fi
+
+echo ""
+echo "Test: OAuth preflight fails closed when expired refresh fails"
+if output=$(
+	PATH="$FAKE_BIN:$PATH" TEST_ROOT="$TEST_ROOT" FUNCTIONS_ONLY="$FUNCTIONS_ONLY" bash <<'EOF' 2>&1
+set -euo pipefail
+source "$FUNCTIONS_ONLY"
+yes_flag=false
+allow_keychain=false
+SANDBOX_BACKEND="native"
+expired_at=$((($(date +%s) - 60) * 1000))
+get_claude_credentials_payload() {
+	printf '{"expiresAt":%s}\n' "$expired_at"
+}
+get_claude_command() {
+	printf 'claude\n'
+}
+run_unsandboxed_claude_refresh() {
+	return 1
+}
+ensure_refreshable_oauth_credentials
+EOF
+); then
+	fail "OAuth preflight exits when expired refresh fails"
+else
+	assert_contains "$output" "Claude OAuth refresh did not complete" "expired refresh failure explains failure"
+	assert_contains "$output" "Run plain \`claude\` to re-authenticate, then retry cco." "expired refresh failure prints reauth guidance"
+fi
+
+echo ""
+echo "Test: OAuth preflight fails closed when expired refresh remains expired"
+if output=$(
+	PATH="$FAKE_BIN:$PATH" TEST_ROOT="$TEST_ROOT" FUNCTIONS_ONLY="$FUNCTIONS_ONLY" bash <<'EOF' 2>&1
+set -euo pipefail
+source "$FUNCTIONS_ONLY"
+yes_flag=false
+allow_keychain=false
+SANDBOX_BACKEND="native"
+expired_at=$((($(date +%s) - 60) * 1000))
+get_claude_credentials_payload() {
+	printf '{"expiresAt":%s}\n' "$expired_at"
+}
+get_claude_command() {
+	printf 'claude\n'
+}
+run_unsandboxed_claude_refresh() {
+	return 0
+}
+ensure_refreshable_oauth_credentials
+EOF
+); then
+	fail "OAuth preflight exits when refreshed credentials remain expired"
+else
+	assert_contains "$output" "Claude OAuth credentials are still expired after the refresh attempt" "still-expired refresh explains failure"
+	assert_contains "$output" "Run plain \`claude\` to re-authenticate, then retry cco." "still-expired refresh prints reauth guidance"
+fi
+
+echo ""
+echo "Test: OAuth preflight backgrounds refresh for valid near-expiry credentials"
+if (
+	PATH="$FAKE_BIN:$PATH"
+	source "$FUNCTIONS_ONLY"
+	yes_flag=false
+	allow_keychain=false
+	SANDBOX_BACKEND="native"
+	background_attempts=0
+	foreground_attempts=0
+	expires_at=$((($(date +%s) + (90 * 60)) * 1000))
+	get_claude_credentials_payload() {
+		printf '{"expiresAt":%s}\n' "$expires_at"
+	}
+	run_unsandboxed_claude_refresh() {
+		foreground_attempts=$((foreground_attempts + 1))
+		return 1
+	}
+	start_background_claude_refresh() {
+		background_attempts=$((background_attempts + 1))
+	}
+	ensure_refreshable_oauth_credentials
+	[[ "$background_attempts" -eq 1 ]]
+	[[ "$foreground_attempts" -eq 0 ]]
+); then
+	pass "OAuth preflight backgrounds refresh for valid near-expiry credentials"
+else
+	fail "OAuth preflight backgrounds refresh for valid near-expiry credentials"
+fi
+
+echo ""
+echo "Test: OAuth preflight skips refresh outside background window"
+if (
+	PATH="$FAKE_BIN:$PATH"
+	source "$FUNCTIONS_ONLY"
+	yes_flag=false
+	allow_keychain=false
+	SANDBOX_BACKEND="native"
+	background_attempts=0
+	foreground_attempts=0
+	expires_at=$((($(date +%s) + (3 * 60 * 60)) * 1000))
+	get_claude_credentials_payload() {
+		printf '{"expiresAt":%s}\n' "$expires_at"
+	}
+	run_unsandboxed_claude_refresh() {
+		foreground_attempts=$((foreground_attempts + 1))
+		return 0
+	}
+	start_background_claude_refresh() {
+		background_attempts=$((background_attempts + 1))
+	}
+	ensure_refreshable_oauth_credentials
+	[[ "$background_attempts" -eq 0 ]]
+	[[ "$foreground_attempts" -eq 0 ]]
+); then
+	pass "OAuth preflight skips refresh outside background window"
+else
+	fail "OAuth preflight skips refresh outside background window"
+fi
+
+echo ""
+echo "Test: OAuth preflight skips refresh when CLAUDE_CODE_OAUTH_TOKEN is set"
+if (
+	PATH="$FAKE_BIN:$PATH"
+	source "$FUNCTIONS_ONLY"
+	export CLAUDE_CODE_OAUTH_TOKEN="test-token"
+	payload_reads=0
+	get_claude_credentials_payload() {
+		payload_reads=$((payload_reads + 1))
+		return 0
+	}
+	ensure_refreshable_oauth_credentials
+	[[ "$payload_reads" -eq 0 ]]
+); then
+	pass "OAuth preflight skips refresh when external token is provided"
+else
+	fail "OAuth preflight skips refresh when external token is provided"
 fi
 
 echo ""
@@ -181,6 +360,30 @@ if (
 	pass "macOS SSH keychain recovery auto-unlocks with --yes"
 else
 	fail "macOS SSH keychain recovery auto-unlocks with --yes"
+fi
+
+echo ""
+echo "Test: auth file checks are skipped when CLAUDE_CODE_OAUTH_TOKEN is set"
+if (
+	PATH="$FAKE_BIN:$PATH"
+	source "$FUNCTIONS_ONLY"
+	export CLAUDE_CODE_OAUTH_TOKEN="test-token"
+	export HOME="$TEST_ROOT/external-token-home"
+	unset CLAUDE_CONFIG_DIR
+	keychain_attempts=0
+	find_claude_config_dir() {
+		printf '%s\n' "$TEST_ROOT/missing-claude-config"
+	}
+	capture_macos_keychain_credentials() {
+		keychain_attempts=$((keychain_attempts + 1))
+		return 1
+	}
+	verify_claude_authentication
+	[[ "$keychain_attempts" -eq 0 ]]
+); then
+	pass "auth file checks are skipped when external token is provided"
+else
+	fail "auth file checks are skipped when external token is provided"
 fi
 
 echo ""
@@ -266,9 +469,31 @@ else
 fi
 
 echo ""
+echo "Test: docker backend receives CLAUDE_CODE_OAUTH_TOKEN from host environment"
+if ! supports_docker; then
+	skip "docker backend unavailable for external-token passthrough"
+elif output=$(
+	HOME="$TEST_ROOT/docker-home" CLAUDE_CODE_OAUTH_TOKEN="test-token" \
+		"$CCO_BIN" --backend docker shell 'printf %s "$CLAUDE_CODE_OAUTH_TOKEN"' 2>&1
+); then
+	if [[ "$(printf '%s\n' "$output" | tail -n 1)" == "test-token" ]]; then
+		pass "docker backend receives external Claude token"
+	else
+		echo "  output:"
+		printf '%s\n' "$output" | sed 's/^/    /'
+		fail "docker backend receives external Claude token"
+	fi
+else
+	echo "  output:"
+	printf '%s\n' "$output" | sed 's/^/    /'
+	fail "docker backend receives external Claude token"
+fi
+
+echo ""
 echo "=== Results ==="
 echo "Passed:  $PASSED"
 echo "Failed:  $FAILED"
+echo "Skipped: $SKIPPED"
 
 if [[ $FAILED -gt 0 ]]; then
 	exit 1

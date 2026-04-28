@@ -145,15 +145,34 @@ persist_scope_slug_for_root() {
 	fi
 }
 
+probe_linux_bwrap() {
+	bwrap --ro-bind / / true
+}
+
+explain_linux_bwrap_failure() {
+	local probe_output="$1"
+	warn "Native Linux sandbox is unavailable: bubblewrap is installed but cannot start."
+	if [[ "$probe_output" == *"setting up uid map"* && "$probe_output" == *"Permission denied"* ]]; then
+		warn "bubblewrap could not set up its uid_map; AppArmor/user-namespace policy is preventing setup."
+	elif [[ -n "$probe_output" ]]; then
+		local first_line="${probe_output%%$'\n'*}"
+		warn "bubblewrap probe failed: $first_line"
+	fi
+}
+
 # Detect available sandbox backends
 detect_sandbox_backend() {
 	local force_backend="$1"
+	local forced_native=false
 
 	if [[ -n "$force_backend" ]]; then
 		case "$force_backend" in
-		native | docker)
-			SANDBOX_BACKEND="$force_backend"
+		docker)
+			SANDBOX_BACKEND="docker"
 			return
+			;;
+		native)
+			forced_native=true
 			;;
 		auto | "")
 			# Continue with auto-detection
@@ -175,6 +194,9 @@ detect_sandbox_backend() {
 		if command -v sandbox-exec &>/dev/null; then
 			SANDBOX_BACKEND="native"
 			log "Using native sandbox (Seatbelt)"
+		elif [[ "$forced_native" == true ]]; then
+			error "Native sandbox was requested with --backend native, but sandbox-exec is not available."
+			exit 1
 		elif command -v docker &>/dev/null && docker info &>/dev/null 2>&1; then
 			SANDBOX_BACKEND="docker"
 			log "Using Docker sandbox (Seatbelt not available)"
@@ -185,12 +207,35 @@ detect_sandbox_backend() {
 	elif [[ "$os" == "Linux" ]]; then
 		# Linux: Check for bubblewrap
 		if command -v bwrap &>/dev/null; then
-			SANDBOX_BACKEND="native"
-			log "Using native sandbox (bubblewrap)"
+			local bwrap_probe_output
+			if bwrap_probe_output=$(probe_linux_bwrap 2>&1); then
+				SANDBOX_BACKEND="native"
+				log "Using native sandbox (bubblewrap)"
+			else
+				explain_linux_bwrap_failure "$bwrap_probe_output"
+				if [[ "$forced_native" == true ]]; then
+					error "Native sandbox was requested with --backend native, so cco cannot fall back automatically."
+					exit 1
+				elif command -v docker &>/dev/null && docker info &>/dev/null 2>&1; then
+					SANDBOX_BACKEND="docker"
+					log "Using Docker sandbox (bubblewrap blocked by host policy)"
+				else
+					error "No sandbox backend available. Install Docker or fix the host bubblewrap/AppArmor policy."
+					exit 1
+				fi
+			fi
 		elif command -v docker &>/dev/null && docker info &>/dev/null 2>&1; then
+			if [[ "$forced_native" == true ]]; then
+				error "Native sandbox was requested with --backend native, but bubblewrap is not installed."
+				exit 1
+			fi
 			SANDBOX_BACKEND="docker"
 			log "Using Docker sandbox (bubblewrap not available)"
 		else
+			if [[ "$forced_native" == true ]]; then
+				error "Native sandbox was requested with --backend native, but bubblewrap is not installed."
+				exit 1
+			fi
 			error "No sandbox backend available. Install bubblewrap or Docker."
 			exit 1
 		fi
@@ -727,6 +772,30 @@ oauth_token_needs_startup_refresh() {
 	((expires_at_ms <= now_ms + refresh_window_ms))
 }
 
+oauth_token_is_expired() {
+	local expires_at_ms="$1"
+	local now_ms
+	now_ms=$(($(date +%s) * 1000))
+
+	((expires_at_ms <= now_ms))
+}
+
+oauth_token_needs_background_refresh() {
+	local expires_at_ms="$1"
+	local now_ms refresh_window_ms
+	now_ms=$(($(date +%s) * 1000))
+	refresh_window_ms=$((2 * 60 * 60 * 1000))
+
+	((expires_at_ms <= now_ms + refresh_window_ms))
+}
+
+oauth_background_refresh_lock_dir() {
+	local marker_key marker_hash
+	marker_key="$(get_claude_config_dir):$SANDBOX_BACKEND"
+	marker_hash=$(sha256_prefix8 "$marker_key") || return 1
+	printf '%s/cco/oauth-refresh-%s.lock\n' "${XDG_CACHE_HOME:-$HOME/.cache}" "$marker_hash"
+}
+
 backend_can_persist_oauth_refresh() {
 	if command -v security &>/dev/null; then
 		if [[ "$SANDBOX_BACKEND" == "native" ]]; then
@@ -743,7 +812,7 @@ backend_can_persist_oauth_refresh() {
 	fi
 
 	if [[ "$SANDBOX_BACKEND" == "native" ]]; then
-		return 0
+		return 1
 	fi
 
 	if [[ "$SANDBOX_BACKEND" == "docker" && "$allow_oauth_refresh" == true ]]; then
@@ -766,7 +835,7 @@ run_unsandboxed_claude_refresh() {
 	read -ra claude_cmd <<<"$claude_cmd_str"
 	refresh_dir=$(mktemp -d)
 
-	log "Running a one-shot unsandboxed Claude call to refresh OAuth credentials..."
+	log "Refreshing Claude OAuth credentials before starting sandbox; this may take a moment..."
 	(
 		cd "$refresh_dir" || exit 1
 		"${claude_cmd[@]}" -p --output-format text --no-session-persistence "Reply with OK and nothing else."
@@ -775,6 +844,23 @@ run_unsandboxed_claude_refresh() {
 
 	rm -rf "$refresh_dir"
 	return "$status"
+}
+
+start_background_claude_refresh() {
+	local lock_dir
+	lock_dir=$(oauth_background_refresh_lock_dir) || return 0
+	mkdir -p "$(dirname "$lock_dir")" 2>/dev/null || return 0
+
+	if ! mkdir "$lock_dir" 2>/dev/null; then
+		log "Claude OAuth credential refresh is already running in the background"
+		return 0
+	fi
+
+	log "Refreshing Claude OAuth credentials in the background before they expire..."
+	(
+		trap 'rmdir "$lock_dir" 2>/dev/null || true' EXIT
+		run_unsandboxed_claude_refresh >/dev/null 2>&1 || true
+	) &
 }
 
 confirm_default_yes() {
@@ -913,6 +999,11 @@ ensure_accessible_macos_keychain_credentials() {
 }
 
 ensure_refreshable_oauth_credentials() {
+	# Token from environment is managed externally; nothing to refresh
+	if [[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; then
+		return 0
+	fi
+
 	local credentials_payload expires_at_ms
 	credentials_payload=$(get_claude_credentials_payload)
 
@@ -924,48 +1015,51 @@ ensure_refreshable_oauth_credentials() {
 		return 0
 	fi
 
-	if ! oauth_token_needs_startup_refresh "$expires_at_ms"; then
-		return 0
-	fi
-
 	if backend_can_persist_oauth_refresh; then
-		warn "Claude OAuth token is expired or near expiry, but this backend can persist a refresh"
+		if oauth_token_needs_startup_refresh "$expires_at_ms"; then
+			warn "Claude OAuth token is expired or near expiry, but this backend can persist a refresh"
+		fi
 		return 0
 	fi
 
-	warn "Claude OAuth token is expired or near expiry"
-	warn "This sandbox path cannot safely persist Claude's refresh back to the host credentials"
-
-	if confirm_default_yes \
-		"cco thinks Claude's OAuth token needs a refresh, and this sandbox cannot save the refreshed credentials back to your host. Run a one-shot plain Claude refresh now before starting cco?" \
-		"--yes enabled; refreshing Claude OAuth credentials before starting cco"; then
+	if oauth_token_is_expired "$expires_at_ms"; then
 		if ! run_unsandboxed_claude_refresh; then
-			error "Claude refresh did not complete successfully"
-			error "Run plain \`$(get_claude_command)\` once outside the sandbox, then retry cco."
+			error "Claude OAuth refresh did not complete"
+			error "Run plain \`$(get_claude_command)\` to re-authenticate, then retry cco."
 			exit 1
 		fi
 
 		credentials_payload=$(get_claude_credentials_payload)
-		if [[ -n "$credentials_payload" ]] && expires_at_ms=$(extract_oauth_expiry_ms "$credentials_payload"); then
-			if oauth_token_needs_startup_refresh "$expires_at_ms"; then
-				error "Claude credentials still look expired after the refresh attempt"
-				error "Run plain \`$(get_claude_command)\` outside the sandbox, finish any login flow, then retry cco."
-				exit 1
-			fi
+		if [[ -z "$credentials_payload" ]] || ! expires_at_ms=$(extract_oauth_expiry_ms "$credentials_payload"); then
+			error "Could not verify Claude OAuth credentials after the refresh attempt"
+			error "Run plain \`$(get_claude_command)\` to re-authenticate, then retry cco."
+			exit 1
+		fi
+
+		if oauth_token_is_expired "$expires_at_ms"; then
+			error "Claude OAuth credentials are still expired after the refresh attempt"
+			error "Run plain \`$(get_claude_command)\` to re-authenticate, then retry cco."
+			exit 1
 		fi
 
 		log "Claude OAuth credentials refreshed"
 		return 0
 	fi
 
-	error "Claude credentials need an out-of-sandbox refresh before this cco session can start"
-	error "Run plain \`$(get_claude_command)\` once outside the sandbox, then retry cco."
-	exit 1
+	if oauth_token_needs_background_refresh "$expires_at_ms"; then
+		start_background_claude_refresh
+	fi
 }
 
 # Verify Claude Code authentication is available
 verify_claude_authentication() {
 	log "Verifying Claude Code authentication..."
+
+	# If CLAUDE_CODE_OAUTH_TOKEN is set, Claude Code will use it directly
+	if [[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; then
+		log "Using CLAUDE_CODE_OAUTH_TOKEN from environment"
+		return 0
+	fi
 
 	local claude_config_dir credentials_file
 	claude_config_dir=$(find_claude_config_dir)
@@ -1588,8 +1682,10 @@ run_native_sandbox() {
 	# Load .env file first (matching Docker backend behavior)
 	if [[ -f ".env" ]]; then
 		while IFS= read -r line || [[ -n "$line" ]]; do
-			# Skip empty lines and comments
-			[[ -z "$line" || "$line" == \#* ]] && continue
+			# Match Docker-style comment handling by ignoring leading whitespace.
+			local trimmed_line="${line#"${line%%[![:space:]]*}"}"
+			[[ -z "$trimmed_line" || "$trimmed_line" == \#* ]] && continue
+			[[ "$trimmed_line" != *"="* ]] && continue
 			local env_key="${line%%=*}"
 			local env_val="${line#*=}"
 			export "${env_key}=${env_val}"
@@ -1878,6 +1974,7 @@ run_container() {
 		# Anthropic / Claude Code
 		"ANTHROPIC_API_KEY"
 		"ANTHROPIC_BASE_URL"
+		"CLAUDE_CODE_OAUTH_TOKEN"
 		"CLAUDE_CONFIG_DIR"
 		# OpenAI / Codex
 		"OPENAI_API_KEY"
@@ -3051,6 +3148,7 @@ if [[ $# -gt 0 ]]; then
 		echo "                        Trust external git common dirs for worktree support"
 		echo "  CCO_SANDBOX_ARGS_FILE Persistent sandbox args file (one arg per line)"
 		echo "  ANTHROPIC_API_KEY     Passed through automatically"
+		echo "  CLAUDE_CODE_OAUTH_TOKEN  Passed through (skips credential file check)"
 		echo "  OPENAI_API_KEY        Passed through automatically"
 		echo "  GEMINI_API_KEY        Passed through automatically"
 		echo "  FACTORY_API_KEY       Passed through automatically"
@@ -3185,38 +3283,45 @@ main() {
 	# If inside a git worktree, the object store lives in the main repo's
 	# .git directory, not the worktree. Add it as an additional dir so both
 	# sandbox backends whitelist it for writes automatically.
+	# Also check immediate subdirectories, since cco may be launched from a
+	# parent folder that contains git worktree checkouts.
 	if [[ "$enable_git_worktree_common_dir" == true ]] && command -v git &>/dev/null; then
-		local git_common_dir_raw git_dir_raw git_common_dir git_dir
-		git_common_dir_raw="$(git rev-parse --git-common-dir 2>/dev/null)" || true
-		git_dir_raw="$(git rev-parse --git-dir 2>/dev/null)" || true
+		local _cco_check_dirs=("$PWD")
+		# Scan immediate subdirs for git repos/worktrees via direct .git glob
+		for _cco_gitdir in "$PWD"/*/.git; do
+			[[ -e "$_cco_gitdir" ]] || continue
+			_cco_check_dirs+=("${_cco_gitdir%/.git}")
+		done
 
-		if [[ -n "$git_common_dir_raw" && -n "$git_dir_raw" ]]; then
-			if git_common_dir="$(resolve_existing_dir "$git_common_dir_raw")"; then
-				if git_dir="$(resolve_existing_dir "$git_dir_raw")"; then
-					local trusted_layout=false
-					if [[ "$git_dir" == "$git_common_dir" ]]; then
-						trusted_layout=true
-					elif [[ "$git_dir" == "$git_common_dir"/worktrees/* ]]; then
-						trusted_layout=true
-					fi
+		for _cco_check_dir in "${_cco_check_dirs[@]}"; do
+			local git_common_dir_raw git_dir_raw git_common_dir git_dir
+			git_common_dir_raw="$(git -C "$_cco_check_dir" rev-parse --git-common-dir 2>/dev/null)" || true
+			git_dir_raw="$(git -C "$_cco_check_dir" rev-parse --git-dir 2>/dev/null)" || true
 
-					if [[ "$trusted_layout" == true || "$allow_external_git_dir" == true ]]; then
-						if [[ "$git_common_dir" != "$PWD"/.git ]] && ! path_in_array "$git_common_dir" "${additional_dirs[@]}"; then
-							additional_dirs+=("$git_common_dir")
-							git_worktree_common_dir="$git_common_dir"
-							log "Adding git common dir for worktree support: $git_common_dir"
+			if [[ -n "$git_common_dir_raw" && -n "$git_dir_raw" ]]; then
+				if git_common_dir="$(resolve_existing_dir "$git_common_dir_raw")"; then
+					if git_dir="$(resolve_existing_dir "$git_dir_raw")"; then
+						local trusted_layout=false
+						if [[ "$git_dir" == "$git_common_dir" ]]; then
+							trusted_layout=true
+						elif [[ "$git_dir" == "$git_common_dir"/worktrees/* ]]; then
+							trusted_layout=true
 						fi
-					else
-						warn "Skipping untrusted git common dir layout: $git_common_dir"
-						warn "Use --allow-external-git-dir (or CCO_ALLOW_EXTERNAL_GIT_DIR=1) to allow it"
+
+						if [[ "$trusted_layout" == true || "$allow_external_git_dir" == true ]]; then
+							if [[ "$git_common_dir" != "$PWD"/.git ]] && ! path_in_array "$git_common_dir" "${additional_dirs[@]}"; then
+								additional_dirs+=("$git_common_dir")
+								git_worktree_common_dir="$git_common_dir"
+								log "Adding git common dir for worktree support: $git_common_dir"
+							fi
+						else
+							warn "Skipping untrusted git common dir layout: $git_common_dir"
+							warn "Use --allow-external-git-dir (or CCO_ALLOW_EXTERNAL_GIT_DIR=1) to allow it"
+						fi
 					fi
-				else
-					warn "Skipping git common dir: unable to resolve git dir path: $git_dir_raw"
 				fi
-			else
-				warn "Skipping git common dir: unable to resolve path: $git_common_dir_raw"
 			fi
-		fi
+		done
 	elif [[ "$enable_git_worktree_common_dir" == false ]]; then
 		log "Git worktree common-dir auto-detection disabled by flag"
 	fi

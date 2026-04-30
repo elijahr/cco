@@ -321,6 +321,33 @@ else
 fi
 
 echo ""
+echo "Test: additionalDirectories is silent when key is absent"
+if output=$(
+	TEST_ROOT="$TEST_ROOT" FUNCTIONS_ONLY="$FUNCTIONS_ONLY" bash <<'EOF' 2>&1
+set -euo pipefail
+source "$FUNCTIONS_ONLY"
+project_dir="$TEST_ROOT/no-additional-directories-project"
+mkdir -p "$project_dir/.claude"
+printf '{"permissions":{"defaultMode":"auto"}}\n' >"$project_dir/.claude/settings.local.json"
+cd "$project_dir"
+additional_dirs=()
+load_additional_directories_from_settings
+EOF
+); then
+	if [[ "$output" == *"Skipping additionalDirectories"* ]]; then
+		echo "  output:"
+		printf '%s\n' "$output" | sed 's/^/    /'
+		fail "missing additionalDirectories key produces no warning"
+	else
+		pass "missing additionalDirectories key produces no warning"
+	fi
+else
+	echo "  output:"
+	printf '%s\n' "$output" | sed 's/^/    /'
+	fail "missing additionalDirectories key does not fail"
+fi
+
+echo ""
 echo "Test: OAuth preflight repairs expired credentials before startup"
 if (
 	PATH="$FAKE_BIN:$PATH"
@@ -524,6 +551,66 @@ if (
 	pass "OAuth preflight skips refresh when settings env has Anthropic auth token"
 else
 	fail "OAuth preflight skips refresh when settings env has Anthropic auth token"
+fi
+
+echo ""
+echo "Test: OAuth preflight does not use managed settings in Docker backend"
+if (
+	PATH="$FAKE_BIN:$PATH"
+	source "$FUNCTIONS_ONLY"
+	unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN
+	export HOME="$TEST_ROOT/docker-managed-home"
+	unset CLAUDE_CONFIG_DIR
+	project_dir="$TEST_ROOT/docker-managed-project"
+	mkdir -p "$project_dir/.claude" "$HOME/.claude"
+	cd "$project_dir"
+	SANDBOX_BACKEND="docker"
+	managed_settings="$TEST_ROOT/docker-managed-settings.json"
+	printf '{"env":{"ANTHROPIC_API_KEY":"managed-api-key"}}\n' >"$managed_settings"
+	claude_managed_settings_path() {
+		printf '%s\n' "$managed_settings"
+	}
+	counter_file="$TEST_ROOT/docker-managed-payload-reads"
+	get_claude_credentials_payload() {
+		printf 'read\n' >>"$counter_file"
+		return 0
+	}
+	ensure_refreshable_oauth_credentials
+	[[ "$(wc -l <"$counter_file")" -eq 1 ]]
+); then
+	pass "Docker backend ignores host managed settings for auth preflight"
+else
+	fail "Docker backend ignores host managed settings for auth preflight"
+fi
+
+echo ""
+echo "Test: OAuth preflight honors higher-priority blank settings auth override"
+if (
+	PATH="$FAKE_BIN:$PATH"
+	source "$FUNCTIONS_ONLY"
+	unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN
+	export HOME="$TEST_ROOT/blank-auth-override-home"
+	unset CLAUDE_CONFIG_DIR
+	mkdir -p "$HOME/.claude"
+	claude_managed_settings_path() {
+		printf '%s\n' "$TEST_ROOT/no-managed-settings.json"
+	}
+	printf '{"env":{"ANTHROPIC_API_KEY":"user-api-key"}}\n' >"$HOME/.claude/settings.json"
+	project_dir="$TEST_ROOT/blank-auth-override-project"
+	mkdir -p "$project_dir/.claude"
+	printf '{"env":{"ANTHROPIC_API_KEY":"   "}}\n' >"$project_dir/.claude/settings.local.json"
+	cd "$project_dir"
+	counter_file="$TEST_ROOT/blank-auth-override-payload-reads"
+	get_claude_credentials_payload() {
+		printf 'read\n' >>"$counter_file"
+		return 0
+	}
+	ensure_refreshable_oauth_credentials
+	[[ "$(wc -l <"$counter_file")" -eq 1 ]]
+); then
+	pass "higher-priority blank settings auth overrides lower-priority value"
+else
+	fail "higher-priority blank settings auth overrides lower-priority value"
 fi
 
 echo ""

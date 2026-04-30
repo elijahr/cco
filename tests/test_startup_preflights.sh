@@ -2,7 +2,7 @@
 # Regression tests for startup recovery preflights.
 # Covers OAuth refresh prompting, macOS-over-SSH keychain recovery,
 # and the global --yes flag.
-# shellcheck disable=SC1090,SC2030,SC2031,SC2034,SC2317
+# shellcheck disable=SC1090,SC2016,SC2030,SC2031,SC2034,SC2317
 
 set -euo pipefail
 

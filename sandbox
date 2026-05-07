@@ -683,6 +683,21 @@ run_macos() {
 		printf '(deny process-exec* (regex #"^%s/Library/Caches/"))\n' "$(policy_quote "$HOME")"
 		printf '(deny process-exec* (regex #"^%s/Documents/"))\n' "$(policy_quote "$HOME")"
 		printf '(deny process-exec* (regex #"^%s/Downloads/"))\n' "$(policy_quote "$HOME")"
+
+		# 10. Deny the Mach IPC privilege-escalation primitive.
+		# mach-priv-task-port controls whether a process can obtain another
+		# task's privileged Mach port — a port that grants debug-level
+		# control over the target (read/write memory, change registers,
+		# inspect threads). Nothing in the normal claude / shell workflow
+		# needs to grab another process's privileged task port; legitimate
+		# debugging tools (lldb, dtrace) are not part of the sandbox's job
+		# and can be invoked outside it.
+		# A broader (deny mach-lookup*) is NOT applied here — that would
+		# block lookups of mDNSResponder, distnoted, CFNetwork bootstrap
+		# services, etc., which the sandboxed claude / Node runtime needs
+		# for ordinary network operation. The existing --allow-keychain
+		# narrow allowlist is preserved unchanged.
+		echo "(deny mach-priv-task-port)"
 	} >"$policy_file"
 
 	# Note: sandbox-exec has limited options (-f, -n, -p, -D)

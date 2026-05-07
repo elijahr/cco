@@ -2059,7 +2059,21 @@ run_native_sandbox() {
 	# Apply custom environment variables after .env so -e flags take precedence
 	apply_custom_env_vars_to_environment
 
-	# Execute in sandbox with full environment
+	# Scrub macOS dyld-injection env vars before handing the process tree to
+	# sandbox-exec. The Seatbelt profile cannot retroactively block a dylib
+	# that was already loaded into the child via DYLD_INSERT_LIBRARIES (or
+	# the framework/library path equivalents) — the load happens in dyld
+	# before any sandbox policy is consulted. --allow-dyld opts back in for
+	# users who need to instrument the sandboxed child intentionally.
+	if [[ "$allow_dyld" != true ]]; then
+		unset DYLD_INSERT_LIBRARIES
+		unset DYLD_FRAMEWORK_PATH
+		unset DYLD_LIBRARY_PATH
+		unset DYLD_FALLBACK_FRAMEWORK_PATH
+		unset DYLD_FALLBACK_LIBRARY_PATH
+	fi
+
+	# Execute in sandbox
 	exec "${cmd[@]}"
 }
 
@@ -3052,6 +3066,7 @@ git_worktree_common_dir=""
 docker_access=false
 allow_oauth_refresh=false
 allow_keychain=false
+allow_dyld=false
 enable_background_tasks=false
 rebuild_image=false
 pull_image=false
@@ -3192,6 +3207,10 @@ while [[ $# -gt 0 ]]; do
 		;;
 	--allow-keychain)
 		allow_keychain=true
+		shift
+		;;
+	--allow-dyld)
+		allow_dyld=true
 		shift
 		;;
 	--enable-background-tasks)
@@ -3488,6 +3507,9 @@ if [[ $# -gt 0 ]]; then
 		echo "                        Use bridge networking instead of host (Docker only)"
 		echo "  --allow-oauth-refresh Allow OAuth token sync-back (experimental, creates backups)"
 		echo "  --allow-keychain      Allow macOS Keychain access (DANGEROUS)"
+		echo "  --allow-dyld          Pass DYLD_* env vars into sandbox (DANGEROUS — enables"
+		echo "                        dyld injection if attacker controls the env or any"
+		echo "                        path on DYLD_LIBRARY_PATH/DYLD_FRAMEWORK_PATH)"
 		echo "  --enable-background-tasks"
 		echo "                        Enable Claude Code background tasks"
 		echo "  --claude-command CMD  Alternative Claude command (e.g., 'ccr code')"

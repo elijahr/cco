@@ -684,6 +684,22 @@ run_macos() {
 		printf '(deny process-exec* (regex #"^%s/Documents/"))\n' "$(policy_quote "$HOME")"
 		printf '(deny process-exec* (regex #"^%s/Downloads/"))\n' "$(policy_quote "$HOME")"
 
+		# 9a. Re-allow process-exec from paths the user explicitly invited cco
+		# into: PWD (the project) and any directory passed via -w/--write.
+		# These paths are user-trusted by construction — cco is being run from
+		# the project, and --write is the explicit "grant access here" knob.
+		# Last-match-wins makes this allow override the broader denies above
+		# only for the specific paths under PWD or --write directories. This
+		# keeps the deny effective for arbitrary attacker plant sites in
+		# /var/folders, /tmp, etc., while supporting projects that legitimately
+		# live under TMPDIR (test fixtures, mktemp-based scratch dirs).
+		printf '(allow process-exec* (subpath "%s"))\n' "$(policy_quote "$PWD_ABS")"
+		for ap in "${write_paths[@]+"${write_paths[@]}"}"; do
+			if [[ -d "$ap" ]]; then
+				printf '(allow process-exec* (subpath "%s"))\n' "$(policy_quote "$ap")"
+			fi
+		done
+
 		# 10. Deny the Mach IPC privilege-escalation primitive.
 		# mach-priv-task-port controls whether a process can obtain another
 		# task's privileged Mach port — a port that grants debug-level

@@ -661,6 +661,28 @@ run_macos() {
 		printf '(deny file-read* (regex #"^%s/Library/Caches/.*\\.dylib$"))\n' "$(policy_quote "$HOME")"
 		printf '(deny file-read* (regex #"^%s/Documents/.*\\.dylib$"))\n' "$(policy_quote "$HOME")"
 		printf '(deny file-read* (regex #"^%s/Downloads/.*\\.dylib$"))\n' "$(policy_quote "$HOME")"
+
+		# 9. Block process-exec of binaries living on user-writable paths.
+		# A hard (deny process-exec*) with a narrow allowlist is not viable in
+		# practice — claude (Node app) execs node, npm, git, ripgrep, fd, awk,
+		# sed, mkdir, ls, ... for its tool surface; the user's shell mode can
+		# legitimately exec anything on PATH. The realistic mitigation is to
+		# deny exec from the specific paths an attacker (or compromised
+		# subprocess) could plant a binary in: tmp dirs, $HOME caches,
+		# user-document dirs. /usr/bin, /bin, /usr/local/bin, /opt are still
+		# reachable, which preserves cco's normal workflow.
+		# Note: by default the SBPL profile is inherited by every descendant
+		# of sandbox-exec, so this also closes the fork→exec→unsandboxed-binary
+		# chain — fork itself is allowed (claude needs it) but the exec step
+		# of any planted attacker binary is blocked.
+		echo "(deny process-exec* (regex #\"^/tmp/\"))"
+		echo "(deny process-exec* (regex #\"^/private/tmp/\"))"
+		echo "(deny process-exec* (regex #\"^/var/tmp/\"))"
+		echo "(deny process-exec* (regex #\"^/var/folders/\"))"
+		echo "(deny process-exec* (regex #\"^/private/var/folders/\"))"
+		printf '(deny process-exec* (regex #"^%s/Library/Caches/"))\n' "$(policy_quote "$HOME")"
+		printf '(deny process-exec* (regex #"^%s/Documents/"))\n' "$(policy_quote "$HOME")"
+		printf '(deny process-exec* (regex #"^%s/Downloads/"))\n' "$(policy_quote "$HOME")"
 	} >"$policy_file"
 
 	# Note: sandbox-exec has limited options (-f, -n, -p, -D)

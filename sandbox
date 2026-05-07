@@ -645,6 +645,22 @@ run_macos() {
 			echo "(allow mach-lookup (global-name \"com.apple.security.othersigning\"))"
 			echo "(allow mach-lookup (global-name \"com.apple.security.credentialstore\"))"
 		fi
+
+		# 8. Defense-in-depth against dyld injection at runtime.
+		# DYLD_* env vars are scrubbed in the cco main script before sandbox-exec
+		# is invoked, but a foothold inside the sandbox could still reach for a
+		# dylib via dlopen()/NSAddImage() at runtime. Block reads of any .dylib
+		# under paths where an attacker (or a confused-deputy bug) could plant one.
+		# These denies are placed last so Seatbelt's last-match-wins semantics
+		# override the broad (allow default) and the file-write* allow on /tmp et al.
+		echo "(deny file-read* (regex #\"^/tmp/.*\\.dylib$\"))"
+		echo "(deny file-read* (regex #\"^/private/tmp/.*\\.dylib$\"))"
+		echo "(deny file-read* (regex #\"^/var/tmp/.*\\.dylib$\"))"
+		echo "(deny file-read* (regex #\"^/var/folders/.*\\.dylib$\"))"
+		echo "(deny file-read* (regex #\"^/private/var/folders/.*\\.dylib$\"))"
+		printf '(deny file-read* (regex #"^%s/Library/Caches/.*\\.dylib$"))\n' "$(policy_quote "$HOME")"
+		printf '(deny file-read* (regex #"^%s/Documents/.*\\.dylib$"))\n' "$(policy_quote "$HOME")"
+		printf '(deny file-read* (regex #"^%s/Downloads/.*\\.dylib$"))\n' "$(policy_quote "$HOME")"
 	} >"$policy_file"
 
 	# Note: sandbox-exec has limited options (-f, -n, -p, -D)
